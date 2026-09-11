@@ -281,18 +281,93 @@ export function useConnection({
   });
 
   const is401Error = useMemoizedFn((error: unknown): boolean => {
-    return Boolean(
-      (error instanceof SseError && error.code === 401) ||
-        (error instanceof Error && error.message.includes("401")) ||
-        (error instanceof Error && error.message.includes("Unauthorized")) ||
-        // Handle fetch errors that might come from streamable HTTP
-        (error instanceof TypeError && error.message.includes("401")) ||
-        // Handle response errors
-        (error &&
-          typeof error === "object" &&
-          "status" in error &&
-          (error as { status: number }).status === 401),
-    );
+    const visited = new Set<unknown>();
+  
+    const check = (value: unknown): boolean => {
+      if (value === null || value === undefined) {
+        return false;
+      }
+  
+      if (visited.has(value)) {
+        return false;
+      }
+  
+      if (typeof value === "object") {
+        visited.add(value);
+      }
+  
+      if (value instanceof SseError && value.code === 401) {
+        return true;
+      }
+  
+      if (value instanceof Error) {
+        if (
+          value.message.includes("401") ||
+          value.message.includes("Unauthorized") ||
+          value.message.includes("No authorization provided") ||
+          value.message.includes("invalid_token")
+        ) {
+          return true;
+        }
+  
+        const extendedError = value as Error & {
+          status?: number;
+          code?: number;
+          data?: unknown;
+          cause?: unknown;
+        };
+  
+        if (
+          extendedError.status === 401 ||
+          extendedError.code === 401 ||
+          check(extendedError.data) ||
+          check(extendedError.cause)
+        ) {
+          return true;
+        }
+      }
+  
+      if (typeof value === "object") {
+        const candidate = value as Record<string, unknown>;
+  
+        if (
+          candidate.status === 401 ||
+          candidate.code === 401 ||
+          candidate.statusCode === 401
+        ) {
+          return true;
+        }
+  
+        if (
+          typeof candidate.message === "string" &&
+          (candidate.message.includes("401") ||
+            candidate.message.includes("Unauthorized") ||
+            candidate.message.includes("No authorization provided") ||
+            candidate.message.includes("invalid_token"))
+        ) {
+          return true;
+        }
+  
+        return (
+          check(candidate.data) ||
+          check(candidate.error) ||
+          check(candidate.cause)
+        );
+      }
+  
+      if (typeof value === "string") {
+        return (
+          value.includes("401") ||
+          value.includes("Unauthorized") ||
+          value.includes("No authorization provided") ||
+          value.includes("invalid_token")
+        );
+      }
+  
+      return false;
+    };
+  
+    return check(error);
   });
 
   const isProxyAuthError = useMemoizedFn((error: unknown): boolean => {
