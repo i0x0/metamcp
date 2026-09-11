@@ -1,11 +1,5 @@
 /**
- * The document CSP holds the script side strict: an inline-script injection is
- * how the transiently-stored downstream MCP OAuth tokens would be read out of
- * sessionStorage, so `script-src` must never carry 'unsafe-inline', and it must
- * not carry 'unsafe-eval' in production, only 'self' plus the per-request
- * nonce. These pin that shape so a later "just add 'unsafe-inline' to fix a
- * script" reintroduces the hole loudly. The one env-dependent relaxation
- * ('unsafe-eval' for `next dev`) is pinned to production-off / development-on.
+ * Security invariants for the per-request document CSP.
  */
 
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -58,8 +52,30 @@ describe("buildContentSecurityPolicy (production)", () => {
     expect(csp).toContain("form-action 'self'");
   });
 
-  it("keeps connect-src same-origin", () => {
-    expect(csp).toContain("connect-src 'self'");
+  it("keeps connect-src same-origin when the allowlist is unset", () => {
+    expect(directive(csp, "connect-src")).toBe("connect-src 'self'");
+  });
+
+  it("adds only canonical configured OAuth origins to connect-src", () => {
+    vi.stubEnv("NODE_ENV", "production");
+    vi.stubEnv(
+      "OAUTH_CONNECT_SRC_ORIGINS",
+      "https://mcp.vercel.com https://VERCEL.com:443",
+    );
+    const widened = buildContentSecurityPolicy("TESTNONCE==");
+    expect(directive(widened, "connect-src")).toBe(
+      "connect-src 'self' https://mcp.vercel.com https://vercel.com",
+    );
+  });
+
+  it("does not include invalid configured OAuth sources", () => {
+    vi.stubEnv("NODE_ENV", "production");
+    vi.stubEnv(
+      "OAUTH_CONNECT_SRC_ORIGINS",
+      "javascript:alert(1) http://vercel.com",
+    );
+    const widened = buildContentSecurityPolicy("TESTNONCE==");
+    expect(directive(widened, "connect-src")).toBe("connect-src 'self'");
   });
 
   it("pins form-action to exactly 'self' when no extra source is given", () => {
@@ -74,16 +90,12 @@ describe("buildContentSecurityPolicy (production)", () => {
     expect(directive(widened, "form-action")).toBe(
       "form-action 'self' https://claude.ai",
     );
-    // Same policy otherwise: the widening must not leak into any other directive.
     const strip = (v: string) => v.replace(/form-action[^;]*/, "form-action X");
     expect(strip(widened)).toBe(strip(csp));
   });
 
   it("allows unsafe-inline for styles only, not scripts", () => {
     const styleSrc = directive(csp, "style-src");
-    // Radix/toast/theme set inline style ATTRIBUTES a nonce cannot cover, so
-    // style-src must keep 'unsafe-inline'. It must not also carry a nonce, or
-    // browsers ignore 'unsafe-inline' next to it.
     expect(styleSrc).toContain("'unsafe-inline'");
     expect(styleSrc).not.toContain("nonce-");
   });
@@ -96,7 +108,7 @@ describe("buildContentSecurityPolicy (production)", () => {
 describe("buildContentSecurityPolicy (development)", () => {
   const csp = cspForEnv("development");
 
-  it("adds 'unsafe-eval' so `next dev` can run, but never 'unsafe-inline'", () => {
+  it("adds unsafe-eval for next dev, but never unsafe-inline", () => {
     const scriptSrc = directive(csp, "script-src");
     expect(scriptSrc).toContain("'unsafe-eval'");
     expect(scriptSrc).not.toContain("unsafe-inline");
