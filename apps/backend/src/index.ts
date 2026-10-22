@@ -3,7 +3,9 @@ import helmet from "helmet";
 
 import { logBasicAuthEnforcementState } from "./auth";
 import { verifyRuntimeDatabaseRole } from "./db/runtime-role-check";
+import { convergeConfiguredAdmins } from "./lib/admin-converge";
 import { warnIfAdminPlaneTokenAuthDisabled } from "./lib/admin-plane-auth";
+import { warnIfApiKeyIpPolicyDisabled } from "./lib/api-key-ip-policy";
 import { authApiCorsMiddleware } from "./lib/cors-policy";
 import { warnOnUnpairedRestrictedEndpoints } from "./lib/endpoint-pairing-check";
 import { globalBodyParser } from "./lib/global-body-parser";
@@ -12,6 +14,7 @@ import {
   buildUpstreamHealthErrorBody,
   isAdminHealthRequest,
 } from "./lib/health-upstream";
+import { initializeRetiredTools } from "./lib/metamcp/retired-tools";
 import { convergeServerBearerTokens } from "./lib/metamcp/server-bearer-converge";
 import { autoNukeStaleSessions } from "./lib/metamcp/session-auto-nuke";
 import { warnIfGatewayBackendSecretUnset } from "./lib/metamcp/url-guard";
@@ -126,6 +129,20 @@ async function start(): Promise<void> {
   // Startup initialization (must run after DB is reachable/migrations are applied, and before listening)
   await initializeOnStartup();
 
+  // Promote the accounts METAMCP_ADMIN_EMAIL names, then warn if the gateway
+  // still has no administrator (fork issue #196). AFTER bootstrap, so an
+  // account BOOTSTRAP_USERS created on this boot can be promoted on this boot;
+  // BEFORE listening, so no request is served under the pre-converge roles.
+  // Independent of BOOTSTRAP_ENABLE on purpose: an install that never used
+  // bootstrap is exactly the one #196 left with zero admins. Unset variable =
+  // no writes. The helper logs and swallows its own failures; this guard is
+  // defence-in-depth so a future throw cannot stop the gateway starting.
+  try {
+    await convergeConfiguredAdmins();
+  } catch (err) {
+    logger.error("Admin converge: unexpected error (ignored):", err);
+  }
+
   // Encrypt any legacy plaintext mcp_servers.bearer_token once, then arm the
   // read path's fail-closed rule. Sequenced AFTER
   // the 0036 migration (applied before start()) and BEFORE the idle pool warms
@@ -173,6 +190,18 @@ async function start(): Promise<void> {
     logger.error("Auto-nuke: unexpected error (ignored):", err);
   }
 
+  // Retired-tool map: load it now so the boot log says how many entries are in
+  // play (and "dropped N" if the platform repository's validator and this
+  // loader ever disagree), or that the feature is inactive. Data only and fail
+  // open: it can only change the text of a call that already failed as an
+  // unknown tool, so it is not fatal and never delays listening. The helper does
+  // not throw; this guard is defence-in-depth.
+  try {
+    initializeRetiredTools();
+  } catch (err) {
+    logger.error("Retired-tools init: unexpected failure (ignored):", err);
+  }
+
   // Surface any pre-existing endpoint left in the unpaired state
   // (restricted=true, require_scoped_api_key=false) so an operator can close
   // the still-open API-key path deliberately. Non-fatal and self-swallowing;
@@ -190,6 +219,12 @@ async function start(): Promise<void> {
   // been switched off with ADMIN_PLANE_TOKEN_AUTH_DISABLED=true (migration
   // 0038), so an emergency disable is legible in the boot log.
   warnIfAdminPlaneTokenAuthDisabled();
+
+  // One boot-time signal when API-key IP allowlists are switched off with
+  // API_KEY_IP_POLICY_DISABLED=true (migration 0041), so an emergency disable
+  // is legible in the boot log rather than discovered when a policy that
+  // looks enforced is not.
+  warnIfApiKeyIpPolicyDisabled();
 
   // One boot-time signal for the effective DISABLE_BASIC_AUTH state, so the
   // boot log records whether password login is on. Reads the DB-backed setting,

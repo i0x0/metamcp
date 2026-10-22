@@ -4,6 +4,7 @@ import {
   CallToolRequestSchema,
   CallToolResult,
   CompatibilityCallToolResultSchema,
+  ErrorCode,
   GetPromptRequestSchema,
   GetPromptResultSchema,
   ListPromptsRequestSchema,
@@ -14,23 +15,29 @@ import {
   ListResourceTemplatesResultSchema,
   ListToolsRequestSchema,
   ListToolsResultSchema,
+  McpError,
   ReadResourceRequestSchema,
   ReadResourceResultSchema,
   ResourceTemplate,
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
+import { McpServerErrorStatusEnum, ServerParameters } from "@repo/zod-types";
 import { z } from "zod";
 
 import logger from "@/utils/logger";
 
-import { namespacesRepository } from "../../db/repositories/namespaces.repo";
+import { mcpServersRepository } from "../../db/repositories/mcp-servers.repo";
 import { toolsImplementations } from "../../trpc/tools.impl";
 import { configService } from "../config.service";
 import { buildM365BrokerErrorResult } from "../m365/broker-error-result";
 import { isM365BrokerError } from "../m365/errors";
 import { ConnectedClient } from "./client";
 import { resolveColdConnectBrokerFallback } from "./cold-connect-broker-fallback";
-import { getMcpServers } from "./fetch-metamcp";
+import {
+  getMcpServers,
+  getNamespaceListingServers,
+  type NamespaceListingServers,
+} from "./fetch-metamcp";
 import { GATEWAY_CAPABILITIES } from "./gateway-capabilities";
 import { requestWithSessionRecovery } from "./list-handler-recovery";
 import { mcpServerPool } from "./mcp-server-pool";
@@ -38,6 +45,7 @@ import { createAuditingMiddleware } from "./metamcp-middleware/auditing.function
 import {
   createFilterCallToolMiddleware,
   createFilterListToolsMiddleware,
+  type ToolFilterCallContext,
 } from "./metamcp-middleware/filter-tools.functional";
 import {
   CallToolHandler,
@@ -45,70 +53,34 @@ import {
   ListToolsHandler,
   MetaMCPHandlerContext,
 } from "./metamcp-middleware/functional-middleware";
+import { createRetiredToolMiddleware } from "./metamcp-middleware/retired-tool.functional";
+import { createTimeoutHintMiddleware } from "./metamcp-middleware/timeout-hint.functional";
 import {
   createToolOverridesCallToolMiddleware,
   createToolOverridesListToolsMiddleware,
-  mapOverrideNameToOriginal,
 } from "./metamcp-middleware/tool-overrides.functional";
-import { isRecoverableBackendError } from "./session-error";
-import { acquireSessionWithBoundedWarmup } from "./tool-call-warmup";
+import {
+  isRecoverableBackendError,
+  isToolCallReplaySafeError,
+} from "./session-error";
+import { recoverFailedSession, SessionRecoveries } from "./session-recovery";
+import { ToolArgSchemaRegistry } from "./tool-arg-keys";
+import {
+  PrefixCandidate,
+  ProbeOutcome,
+  routeUnmappedToolCall,
+} from "./tool-call-routing";
 import {
   parseToolName,
   registerToolRoute,
   ToolRouteOwner,
 } from "./tool-name-parser";
+import {
+  toolsListRenotifyEnabled,
+  toolsListRenotifyWatch,
+} from "./tools-list-renotify";
 import { toolsSyncCache } from "./tools-sync-cache";
 import { sanitizeName } from "./utils";
-
-/**
- * Filter out tools that are overrides of existing tools to prevent duplicates in database
- * Uses the existing tool overrides cache for optimal performance
- */
-async function filterOutOverrideTools(
-  tools: Tool[],
-  namespaceUuid: string,
-  serverName: string,
-): Promise<Tool[]> {
-  if (!tools || tools.length === 0) {
-    return tools;
-  }
-
-  const filteredTools: Tool[] = [];
-
-  await Promise.allSettled(
-    tools.map(async (tool) => {
-      try {
-        // Check if this tool name is actually an override name for an existing tool
-        // by using the existing mapOverrideNameToOriginal function
-        const fullToolName = `${sanitizeName(serverName)}__${tool.name}`;
-        const originalName = await mapOverrideNameToOriginal(
-          fullToolName,
-          namespaceUuid,
-          true, // use cache
-        );
-
-        // If the original name is different from the current name,
-        // this tool is an override and should be filtered out
-        if (originalName !== fullToolName) {
-          // This is an override, skip it (don't save to database)
-          return;
-        }
-
-        // This is not an override, include it
-        filteredTools.push(tool);
-      } catch (error) {
-        logger.error(
-          `Error checking if tool ${tool.name} is an override:`,
-          error,
-        );
-        // On error, include the tool (fail-safe behavior)
-        filteredTools.push(tool);
-      }
-    }),
-  );
-
-  return filteredTools;
-}
 
 export const createServer = async (
   namespaceUuid: string,
@@ -189,34 +161,144 @@ export const createServer = async (
       }
     }
 
-    const subscriber = async (): Promise<void> => {
-      toolsSyncCache.clear(mcpServerUuid);
-      try {
-        await server.notification({
-          method: "notifications/tools/list_changed",
-          params: {},
-        });
-      } catch (notifyError) {
-        logger.warn(
-          `Failed to forward tools/list_changed upstream for server ${mcpServerUuid}:`,
-          notifyError,
-        );
-      }
-    };
+    const subscriber = (): Promise<void> => emitToolListChanged(mcpServerUuid);
 
     session.listChangedSubscribers.add(subscriber);
     registeredSubscriptions.add({ client: session, subscriber });
   };
 
+  /**
+   * Tell this session's client that `mcpServerUuid`'s tools changed: drop the
+   * server's tools-sync hash and the audit snapshot, then send
+   * `notifications/tools/list_changed` upstream. Used by the backend
+   * subscriber above and by the tools/list re-notify below. Never throws.
+   */
+  const emitToolListChanged = async (mcpServerUuid: string): Promise<void> => {
+    toolsSyncCache.clear(mcpServerUuid);
+    // A changed backend surface invalidates the audit snapshot immediately;
+    // stale names must not remain verified until the consumer lists again.
+    toolSchemaGeneration += 1;
+    toolArgSchemas.replace([]);
+    try {
+      await server.notification({
+        method: "notifications/tools/list_changed",
+        params: {},
+      });
+    } catch (notifyError) {
+      logger.warn(
+        `Failed to forward tools/list_changed upstream for server ${mcpServerUuid}:`,
+        notifyError,
+      );
+    }
+  };
+
+  // Servers this session's last tools/list left out because they could not
+  // be reached, each with the cancel function of its re-notify watch. The
+  // session is owed one list_changed per server once it answers again, so a
+  // client that re-listed into a backend restart (and replaced its tool set
+  // with the reduced listing) gets those tools back without reconnecting.
+  // See tools-list-renotify.ts for the defect and the probe.
+  const owedServers = new Map<string, () => void>();
+  // How many times each server was re-notified and then failed this
+  // session's re-list again. Starts that server's next watch further along
+  // the backoff, so a flapping backend cannot drive a re-list every two
+  // seconds. Cleared by a listing that reaches the server.
+  const renotifyRounds = new Map<string, number>();
+  let proxyClosed = false;
+
+  // Does an owed server answer for a listing again? Not while its error gate
+  // is set: the listing would leave it out again, so telling the session to
+  // re-list would only earn it another error. The gate is checked first, so
+  // a gated server is not sent a request at all (and the pool's connect path
+  // refuses a gated server anyway). It is reset by the pool's half-open
+  // probe or by an operator; the probe after that decides.
+  const probeOwedServer = async (
+    params: ServerParameters,
+  ): Promise<boolean> => {
+    // The pool's isServerInErrorState returns false on a failed read. That
+    // cannot establish that the gate is clear: an existing pooled client
+    // could answer and discharge this watch while the backend stays gated.
+    // Let a read failure reach the watch's retry path, and require a current
+    // row with NONE before any backend request (a deleted server is not up).
+    const current = await mcpServersRepository.findByUuid(params.uuid);
+    return (
+      current?.error_status === McpServerErrorStatusEnum.enum.NONE &&
+      (await mcpServerPool.probeServerTools(params, namespaceUuid))
+    );
+  };
+
+  const onOwedServerAnswers = (mcpServerUuid: string, serverName: string) => {
+    if (proxyClosed || !owedServers.delete(mcpServerUuid)) return;
+    renotifyRounds.set(
+      mcpServerUuid,
+      (renotifyRounds.get(mcpServerUuid) ?? 0) + 1,
+    );
+    logger.info(
+      `tools/list re-notify: server ${serverName} (${mcpServerUuid}) answers tools/list again; sending notifications/tools/list_changed to session ${sessionId}`,
+    );
+    void emitToolListChanged(mcpServerUuid);
+  };
+
+  /**
+   * After a listing: settle what this session is owed. A server the listing
+   * reached, or that left the namespace, is owed nothing; a server it could
+   * not reach gets a watch (one per server, kept until it answers or the
+   * session closes). `mountedServerUuids` includes the error-gated servers:
+   * a gated server is still mounted, so its watch must not be cancelled as
+   * if it had left.
+   */
+  const settleOwedServers = (
+    mountedServerUuids: ReadonlySet<string>,
+    settledServerUuids: ReadonlySet<string>,
+    unreachableServers: ReadonlyMap<string, ServerParameters>,
+  ): void => {
+    for (const [mcpServerUuid, cancel] of owedServers) {
+      if (
+        settledServerUuids.has(mcpServerUuid) ||
+        !mountedServerUuids.has(mcpServerUuid)
+      ) {
+        cancel();
+        owedServers.delete(mcpServerUuid);
+      }
+    }
+    for (const mcpServerUuid of settledServerUuids) {
+      renotifyRounds.delete(mcpServerUuid);
+    }
+    if (proxyClosed || !toolsListRenotifyEnabled()) return;
+    for (const [mcpServerUuid, params] of unreachableServers) {
+      if (owedServers.has(mcpServerUuid)) continue;
+      const serverName = params.name || mcpServerUuid;
+      const cancel = toolsListRenotifyWatch.watch(
+        mcpServerUuid,
+        () => probeOwedServer(params),
+        () => onOwedServerAnswers(mcpServerUuid, serverName),
+        renotifyRounds.get(mcpServerUuid) ?? 0,
+      );
+      owedServers.set(mcpServerUuid, cancel);
+      logger.info(
+        `tools/list re-notify: session ${sessionId} is owed notifications/tools/list_changed for server ${serverName} (${mcpServerUuid}), which this listing left out`,
+      );
+    }
+  };
+
+  const stopOwedServerWatches = (): void => {
+    proxyClosed = true;
+    for (const cancel of owedServers.values()) cancel();
+    owedServers.clear();
+    renotifyRounds.clear();
+  };
+
   // Detach all subscribers when this upstream Server closes — otherwise
   // they outlive the proxy server (the backend ConnectedClient is pooled
   // and keeps the subscriber set alive). The `Server` exposes `onclose`
-  // from the underlying `Protocol`; we install our hook here.
+  // from the underlying `Protocol`; we install our hook here. The owed
+  // re-notify watches stop with it: there is no client left to tell.
   server.onclose = () => {
     for (const { client, subscriber } of registeredSubscriptions) {
       client.listChangedSubscribers.delete(subscriber);
     }
     registeredSubscriptions.clear();
+    stopOwedServerWatches();
   };
 
   // Create the handler context
@@ -224,6 +306,8 @@ export const createServer = async (
     namespaceUuid,
     sessionId,
   };
+  const toolArgSchemas = new ToolArgSchemaRegistry();
+  let toolSchemaGeneration = 0;
 
   // Original List Tools Handler
   const originalListToolsHandler: ListToolsHandler = async (
@@ -235,10 +319,45 @@ export const createServer = async (
       namespaceUuid,
     );
     const startTime = performance.now();
-    const serverParams = await getMcpServers(
-      context.namespaceUuid,
-      includeInactiveServers,
-    );
+    // Not getMcpServers: it hides an error-gated server and answers {} when
+    // the read fails, and this listing read either as "the namespace mounts
+    // nothing", a successful empty answer that also cancelled the session's
+    // owed re-notifies. A failed read is a retryable error here, thrown
+    // before anything below prunes routes or settles what is owed.
+    let listing: NamespaceListingServers;
+    try {
+      listing = await getNamespaceListingServers(
+        context.namespaceUuid,
+        includeInactiveServers,
+      );
+    } catch (error) {
+      logger.error(
+        `tools/list could not read the servers of namespace ${namespaceUuid}; answering a retryable error, not an empty list:`,
+        error,
+      );
+      throw new McpError(
+        ErrorCode.InternalError,
+        "tools/list could not read this namespace's servers: no tools were listed, which is not the same as an empty tool list. Retry shortly.",
+        {
+          code: "backend_unavailable",
+          reason: "namespace_lookup_failed",
+          servers: [],
+          retryable: true,
+        },
+      );
+    }
+    // The routable servers, the same set getMcpServers answers: the only ones
+    // this listing connects to, warms or keeps routes for.
+    const serverParams = listing.routable;
+    // A live proxy outlasts namespace edits. Drop removed owners before the
+    // collision guard so a same-named replacement can list its own tools.
+    for (const [toolName, owner] of toolNameOwner) {
+      if (!serverParams[owner.uuid]) {
+        toolNameOwner.delete(toolName);
+        delete toolToClient[toolName];
+        delete toolToServerUuid[toolName];
+      }
+    }
     const allTools: Tool[] = [];
 
     // Servers that should have contributed but didn't — used for the
@@ -247,6 +366,41 @@ export const createServer = async (
     // 0-tool namespace and nobody notices until a human runs
     // `docker restart metamcp` (the zero-tool outage).
     const failedServers: string[] = [];
+    // Per-server outcome by uuid, for the owed re-notify (settleOwedServers).
+    // Settled: this listing reached the server (it listed, has no tools, is
+    // a self-reference, or has a misconfigured name no reconnect would fix),
+    // so nothing about it is owed. Unreachable: no session, or its listing
+    // failed after recovery; owed a list_changed once it answers.
+    const settledServerUuids = new Set<string>();
+    const unreachableServers = new Map<string, ServerParameters>();
+    // The unreachable servers that are error-gated, named as such in the error.
+    const errorGatedUuids = new Set<string>();
+
+    // Error-gated servers are mounted but never connected to (the pool's
+    // connect path refuses them too). They are unreachable for this listing:
+    // owed a re-notify, and part of the error when nothing else lists tools.
+    // A misconfigured name stays excluded exactly as below, since resetting
+    // the gate would not make it listable.
+    for (const [mcpServerUuid, params] of Object.entries(listing.errorGated)) {
+      if (isSameServerInstance(params, mcpServerUuid)) {
+        settledServerUuids.add(mcpServerUuid);
+        continue;
+      }
+      if (params.name && sanitizeName(params.name).includes("__")) {
+        logger.error(
+          `Cannot list tools for server ${mcpServerUuid}: name ${JSON.stringify(params.name)} contains the tool-name separator`,
+        );
+        failedServers.push(params.name);
+        settledServerUuids.add(mcpServerUuid);
+        continue;
+      }
+      logger.error(
+        `tools/list: server ${params.name || mcpServerUuid} is error-gated; excluded from namespace response until its error state is reset`,
+      );
+      failedServers.push(params.name || mcpServerUuid);
+      unreachableServers.set(mcpServerUuid, params);
+      errorGatedUuids.add(mcpServerUuid);
+    }
 
     // Track visited servers to detect circular references - reset on each call
     const visitedServers = new Set<string>();
@@ -280,7 +434,7 @@ export const createServer = async (
       );
     }
 
-    await Promise.allSettled(
+    const listingOutcomes = await Promise.allSettled(
       allServerEntries.map(async ([mcpServerUuid, params]) => {
         logger.debug(
           `[DEBUG-TOOLS] 🔧 Server: ${params.name || mcpServerUuid}`,
@@ -291,6 +445,17 @@ export const createServer = async (
           logger.debug(
             `[DEBUG-TOOLS] ⏭️  Skipping already visited: ${params.name}`,
           );
+          return;
+        }
+        // A stored separator is a configuration exclusion even while the
+        // backend is down. Check it before connecting so retryable recovery
+        // is reserved for servers a reconnect can actually make listable.
+        if (params.name && sanitizeName(params.name).includes("__")) {
+          logger.error(
+            `Cannot list tools for server ${mcpServerUuid}: name ${JSON.stringify(params.name)} contains the tool-name separator`,
+          );
+          failedServers.push(params.name);
+          settledServerUuids.add(mcpServerUuid);
           return;
         }
         const session = await mcpServerPool.getSession(
@@ -308,6 +473,7 @@ export const createServer = async (
             `tools/list: no session available for server ${params.name || mcpServerUuid} — excluded from namespace response (error state, connection cap, or backend unreachable)`,
           );
           failedServers.push(params.name || mcpServerUuid);
+          unreachableServers.set(mcpServerUuid, params);
           return;
         }
 
@@ -318,6 +484,7 @@ export const createServer = async (
         //   - Backend restart cycle: pool invalidation hands us a fresh
         //     ConnectedClient whose subscriber set is empty.
         registerListChangedSubscriber(session, mcpServerUuid);
+        settledServerUuids.add(mcpServerUuid);
 
         // Now check for self-referencing using the actual MCP server name
         const serverVersion = session.client.getServerVersion();
@@ -345,6 +512,17 @@ export const createServer = async (
         // Use name assigned by user, fallback to name from server
         const serverName =
           params.name || session.client.getServerVersion()?.name || "";
+
+        // The first '__' separates the server from the backend tool. A stored
+        // server name containing it cannot round-trip and could borrow an
+        // ACTIVE row on the parent prefix while listing an unreviewed tool.
+        if (sanitizeName(serverName).includes("__")) {
+          logger.error(
+            `Cannot list tools for server ${mcpServerUuid}: name ${JSON.stringify(serverName)} contains the tool-name separator`,
+          );
+          failedServers.push(serverName || mcpServerUuid);
+          return;
+        }
 
         try {
           const toolFetchStart = performance.now();
@@ -408,7 +586,10 @@ export const createServer = async (
 
           // Save original tools to database (before middleware processing)
           // This ensures we only save the actual tool names, not override names
-          // Filter out tools that are overrides of existing tools to prevent duplicates
+          // These are raw backend names. A namespace alias can match a real
+          // backend tool, so reverse-mapping here would omit that native tool
+          // from the catalog shared by every namespace. Presentation overrides
+          // belong only in the response middleware, never in this write.
           try {
             // PERFORMANCE OPTIMIZATION: Check hash FIRST to avoid expensive operations
             // Hash the FULL definitions (name + description + inputSchema); a
@@ -423,22 +604,28 @@ export const createServer = async (
               `[DEBUG-TOOLS] 🔍 Hash check for ${serverName}: ${hasChanged ? "CHANGED" : "UNCHANGED"}`,
             );
 
-            if (hasChanged) {
-              const toolsToSave = await filterOutOverrideTools(
-                allServerTools,
-                namespaceUuid,
-                serverName,
-              );
-
-              if (toolsToSave.length > 0) {
-                // Update cache with the full definitions we just observed
-                toolsSyncCache.update(mcpServerUuid, allServerTools);
-
-                // Sync with cleanup
-                await toolsImplementations.sync({
-                  tools: toolsToSave,
+            if (hasChanged && allServerTools.length > 0) {
+              // Claim the full definitions we just observed, so concurrent
+              // listings of the same set skip, then write. The write must
+              // not re-check this cache: `tools.impl` sync used to, found
+              // the hash claimed here and skipped, so this path never wrote
+              // the catalog (see syncFromListing). The claim is released if
+              // the write fails, so the next tools/list retries it instead
+              // of skipping a write that never happened.
+              toolsSyncCache.update(mcpServerUuid, allServerTools);
+              try {
+                await toolsImplementations.syncFromListing({
+                  tools: allServerTools,
                   mcpServerUuid: mcpServerUuid,
                 });
+                // A different listing can claim a newer hash while this
+                // write is in flight, then commit first. Record the set
+                // THIS completed write persisted, so a later current
+                // listing retries instead of treating a stale catalog as current.
+                toolsSyncCache.update(mcpServerUuid, allServerTools);
+              } catch (writeError) {
+                toolsSyncCache.clear(mcpServerUuid);
+                throw writeError;
               }
             }
           } catch (dbError) {
@@ -481,7 +668,6 @@ export const createServer = async (
             }
             toolToClient[toolName] = activeSession;
             toolToServerUuid[toolName] = mcpServerUuid;
-
             toolsWithSource.push({
               ...tool,
               name: toolName,
@@ -493,8 +679,37 @@ export const createServer = async (
         } catch (error) {
           logger.error(`Error fetching tools from: ${serverName}`, error);
           failedServers.push(serverName || mcpServerUuid);
+          settledServerUuids.delete(mcpServerUuid);
+          unreachableServers.set(mcpServerUuid, params);
         }
       }),
+    );
+
+    // Session acquisition and capability reads can reject before the
+    // per-listing catch. Promise.allSettled isolates those failures, but
+    // ignoring its rejected outcomes would still turn them into a successful
+    // empty list and leave the session without a recovery notification.
+    for (const [index, [mcpServerUuid, params]] of allServerEntries.entries()) {
+      const outcome = listingOutcomes[index];
+      if (outcome?.status !== "rejected") continue;
+      logger.error(
+        `Error preparing tools listing for: ${params.name || mcpServerUuid}`,
+        outcome.reason,
+      );
+      failedServers.push(params.name || mcpServerUuid);
+      settledServerUuids.delete(mcpServerUuid);
+      unreachableServers.set(mcpServerUuid, params);
+    }
+
+    // Mounted means routable or error-gated: a gated server's watch stays.
+    const mountedServerUuids = new Set([
+      ...Object.keys(serverParams),
+      ...Object.keys(listing.errorGated),
+    ]);
+    settleOwedServers(
+      mountedServerUuids,
+      settledServerUuids,
+      unreachableServers,
     );
 
     const totalTime = performance.now() - startTime;
@@ -510,18 +725,195 @@ export const createServer = async (
     // weeks before the zero-tool outage.
     if (failedServers.length > 0) {
       logger.error(
-        `tools/list DEGRADED for namespace ${namespaceUuid}: ${failedServers.length}/${allServerEntries.length} backend server(s) failed (${failedServers.join(", ")}); returning ${allTools.length} tools`,
+        `tools/list DEGRADED for namespace ${namespaceUuid}: ${failedServers.length}/${mountedServerUuids.size} backend server(s) failed (${failedServers.join(", ")}); returning ${allTools.length} tools`,
+      );
+    }
+
+    // No tools at all while a server could not be reached: answer an error,
+    // never an empty list. An empty result says "this namespace has no
+    // tools", and a client that re-lists on list_changed replaces its whole
+    // tool set with it. That is how a backend restart emptied a one-server
+    // namespace for a long-lived session until it reconnected. With an error
+    // the client keeps the tools it had (a call meanwhile gets the retryable
+    // backend unavailable answer) and, through the owed re-notify above, is
+    // told to list again once the server answers. A partial listing (some
+    // server listed tools) is still returned: partial truth beats a hard
+    // error for the servers that work, and the unreachable ones are owed a
+    // re-notify. An error-gated server counts as unreachable: its gate is
+    // reset by the pool's half-open probe or by an operator, so the error is
+    // retryable and the session is owed the same re-notify. A server excluded
+    // for a misconfigured name is not part of this: no retry fixes it, and
+    // an error would only make every listing of the namespace fail until it
+    // is renamed (it stays in the DEGRADED line).
+    if (allTools.length === 0 && unreachableServers.size > 0) {
+      const unreachableNames = Array.from(
+        unreachableServers,
+        ([mcpServerUuid, params]) => params.name || mcpServerUuid,
+      );
+      const described = Array.from(
+        unreachableServers,
+        ([mcpServerUuid, params]) =>
+          `${JSON.stringify(params.name || mcpServerUuid)}${
+            errorGatedUuids.has(mcpServerUuid) ? " (error-gated)" : ""
+          }`,
+      );
+      const renotify = toolsListRenotifyEnabled()
+        ? " This session gets notifications/tools/list_changed when the server answers again."
+        : "";
+      throw new McpError(
+        ErrorCode.InternalError,
+        `tools/list could not reach ${described.join(", ")}: no tools were listed, which is not the same as an empty tool list. Retry shortly.${renotify}`,
+        {
+          code: "backend_unavailable",
+          servers: unreachableNames,
+          retryable: true,
+        },
       );
     }
 
     return { tools: allTools };
   };
 
+  // Session recoveries started by this proxy's tool calls, one per failed
+  // client however many calls fail on it (session-recovery.ts). Per proxy,
+  // because a proxy serves exactly one session id.
+  const recoveries: SessionRecoveries = new WeakMap();
+
+  const listToolPages = async (
+    session: ConnectedClient,
+  ): Promise<z.infer<typeof ListToolsResultSchema>[]> => {
+    const pages: z.infer<typeof ListToolsResultSchema>[] = [];
+    let cursor: string | undefined = undefined;
+    let hasMore = true;
+    while (hasMore) {
+      const page: z.infer<typeof ListToolsResultSchema> =
+        await session.client.request(
+          {
+            method: "tools/list",
+            params: { cursor },
+          },
+          ListToolsResultSchema,
+        );
+      pages.push(page);
+      cursor = page.nextCursor;
+      hasMore = !!page.nextCursor;
+    }
+    return pages;
+  };
+
+  /**
+   * Does this prefix-matched server serve the tool? Lists its tools (all
+   * pages) and looks for the backend name. A stale pooled session answers
+   * tools/list with the same session-lost envelope as tools/call, so a
+   * recoverable failure gets one recovery (shared with any parallel call
+   * failing on the same client) and one more listing; a timeout or any other
+   * failure is reported as a failed lookup, never as "no such tool".
+   */
+  const probeServerForTool = async (
+    session: ConnectedClient,
+    candidate: PrefixCandidate,
+    name: string,
+    serverPrefix: string,
+    originalToolName: string,
+  ): Promise<ProbeOutcome> => {
+    // Idempotent. Tools discovered only through this lookup never pass the
+    // list handler's getSession, so without this they would never get a
+    // list_changed subscriber.
+    registerListChangedSubscriber(session, candidate.uuid);
+
+    if (!session.client.getServerCapabilities()?.tools) {
+      return { kind: "absent" };
+    }
+    // The configured name already matched the prefix; this is the final gate
+    // for a server stored with no name, identified by its backend name.
+    const serverName =
+      candidate.params.name || session.client.getServerVersion()?.name || "";
+    if (sanitizeName(serverName) !== serverPrefix) {
+      return { kind: "absent" };
+    }
+
+    let activeSession = session;
+    let pages: z.infer<typeof ListToolsResultSchema>[];
+    try {
+      pages = await listToolPages(activeSession);
+    } catch (error) {
+      if (!isRecoverableBackendError(error)) {
+        logger.warn(
+          `Tool lookup on server ${candidate.uuid} failed while routing tool ${JSON.stringify(name)}; the server is mounted, so this is reported as unavailable, not as an unknown tool. (${
+            error instanceof Error ? error.message : String(error)
+          })`,
+        );
+        return { kind: "lookup_failed" };
+      }
+      logger.warn(
+        `Backend connection lost for server ${candidate.uuid} on dynamic tools/list while routing tool ${JSON.stringify(name)}; recovering the session and retrying once. (envelope: ${
+          error instanceof Error ? error.message : String(error)
+        })`,
+      );
+      let fresh: ConnectedClient | undefined;
+      try {
+        fresh = await recoverFailedSession({
+          pool: mcpServerPool,
+          recoveries,
+          sessionId,
+          serverUuid: candidate.uuid,
+          failedClient: activeSession,
+          reacquire: () =>
+            mcpServerPool.getSession(
+              sessionId,
+              candidate.uuid,
+              candidate.params,
+              namespaceUuid,
+            ),
+        });
+      } catch (recoveryError) {
+        logger.error(
+          `Failed to re-initialize session for server ${candidate.uuid} after backend session loss during dynamic tool routing:`,
+          recoveryError,
+        );
+        return { kind: "no_session" };
+      }
+      if (!fresh) {
+        logger.error(
+          `Failed to re-initialize session for server ${candidate.uuid} after backend session loss during dynamic tool routing`,
+        );
+        return { kind: "no_session" };
+      }
+      registerListChangedSubscriber(fresh, candidate.uuid);
+      activeSession = fresh;
+      try {
+        pages = await listToolPages(activeSession);
+      } catch (retryError) {
+        logger.warn(
+          `Tool lookup on server ${candidate.uuid} failed again after session recovery while routing tool ${JSON.stringify(name)}. (${
+            retryError instanceof Error
+              ? retryError.message
+              : String(retryError)
+          })`,
+        );
+        return { kind: "lookup_failed" };
+      }
+    }
+
+    const listed = pages.some((page) =>
+      page.tools?.some((tool: Tool) => tool.name === originalToolName),
+    );
+    return listed
+      ? { kind: "found", session: activeSession }
+      : { kind: "absent" };
+  };
+
+  /** Drop every route that still points at a client whose recovery failed. */
+  const forgetRoutesTo = (failedClient: ConnectedClient): void => {
+    for (const [routedName, routedClient] of Object.entries(toolToClient)) {
+      if (routedClient === failedClient) {
+        delete toolToClient[routedName];
+      }
+    }
+  };
+
   // Original Call Tool Handler
-  const originalCallToolHandler: CallToolHandler = async (
-    request,
-    _context,
-  ) => {
+  const originalCallToolHandler: CallToolHandler = async (request, context) => {
     const { name, arguments: args } = request.params;
 
     // Parse the tool name using shared utility
@@ -531,210 +923,60 @@ export const createServer = async (
     }
 
     const { serverName: serverPrefix, originalToolName } = parsed;
+    const { allowedToolServerUuids } = context as ToolFilterCallContext;
+    const isAllowedServer = (uuid: string): boolean =>
+      !allowedToolServerUuids || allowedToolServerUuids.includes(uuid);
 
     // Try to find the tool in pre-populated mappings first
-    let clientForTool = toolToClient[name];
-    let serverUuid = toolToServerUuid[name];
+    let clientForTool: ConnectedClient | undefined = toolToClient[name];
+    let serverUuid: string | undefined = toolToServerUuid[name];
+    if (serverUuid && !isAllowedServer(serverUuid)) {
+      // The filter checked today's mounts, but this live proxy may retain the
+      // removed server's route. Resolve again instead of executing that client.
+      delete toolToClient[name];
+      delete toolToServerUuid[name];
+      toolNameOwner.delete(name);
+      clientForTool = undefined;
+      serverUuid = undefined;
+    }
 
-    // If not found in mappings, dynamically find the server and route the call
+    // Not in the routing map: resolve the server from the tool's prefix.
+    // Only the namespace's servers whose name matches the prefix are touched;
+    // a miss on a mounted server answers "backend unavailable" (the tool was
+    // not run, retry) instead of "Unknown tool". See tool-call-routing.ts.
     if (!clientForTool || !serverUuid) {
-      try {
-        // Get all MCP servers for this namespace
-        const serverParams = await getMcpServers(
-          namespaceUuid,
-          includeInactiveServers,
-        );
-
-        // Find the server with the matching name prefix
-        for (const [mcpServerUuid, params] of Object.entries(serverParams)) {
-          const session = await mcpServerPool.getSession(
-            sessionId,
-            mcpServerUuid,
-            params,
-            namespaceUuid,
-          );
-
-          if (session) {
-            // Idempotent — see registerListChangedSubscriber dedupe note.
-            // Required here too: tools discovered only via dynamic-find
-            // never hit the `originalListToolsHandler` `getSession`, so
-            // without this they'd never get a subscriber attached.
-            registerListChangedSubscriber(session, mcpServerUuid);
-
-            const capabilities = session.client.getServerCapabilities();
-            if (!capabilities?.tools) continue;
-
-            // Use name assigned by user, fallback to name from server
-            const serverName =
-              params.name || session.client.getServerVersion()?.name || "";
-
-            if (sanitizeName(serverName) === serverPrefix) {
-              // Found the server, now check if it has this tool with pagination.
-              // If the cached session is stale (backend restarted between when
-              // we last connected and now), `tools/list` returns the same
-              // -32600 / "Session not found" envelope as `tools/call`. Engage
-              // the same recovery path: invalidate the pool entry, re-acquire
-              // a fresh session, retry once. Without this the dynamic-find
-              // path silently swallows the failure (logs error, continues to
-              // next server) and the agent gets `Unknown tool` instead of
-              // either a successful tool call or a real not-found error.
-              const listToolsOnce = async (
-                activeSession: ConnectedClient,
-              ): Promise<z.infer<typeof ListToolsResultSchema>[]> => {
-                const pages: z.infer<typeof ListToolsResultSchema>[] = [];
-                let cursor: string | undefined = undefined;
-                let hasMore = true;
-                while (hasMore) {
-                  const page: z.infer<typeof ListToolsResultSchema> =
-                    await activeSession.client.request(
-                      {
-                        method: "tools/list",
-                        params: { cursor },
-                      },
-                      ListToolsResultSchema,
-                    );
-                  pages.push(page);
-                  cursor = page.nextCursor;
-                  hasMore = !!page.nextCursor;
-                }
-                return pages;
-              };
-
-              const matchOnPages = (
-                pages: z.infer<typeof ListToolsResultSchema>[],
-              ): boolean =>
-                pages.some((page) =>
-                  page.tools?.some(
-                    (tool: Tool) => tool.name === originalToolName,
-                  ),
-                );
-
-              try {
-                let activeSession = session;
-                let pages: z.infer<typeof ListToolsResultSchema>[];
-                try {
-                  pages = await listToolsOnce(activeSession);
-                } catch (error) {
-                  if (!isRecoverableBackendError(error)) {
-                    throw error;
-                  }
-                  logger.warn(
-                    `Backend connection lost for server ${mcpServerUuid} on dynamic tools/list while routing tool "${name}"; invalidating pool and retrying once. (envelope: ${
-                      error instanceof Error ? error.message : String(error)
-                    })`,
-                  );
-                  await mcpServerPool.invalidateServerConnection(
-                    sessionId,
-                    mcpServerUuid,
-                  );
-                  const fresh = await mcpServerPool.getSession(
-                    sessionId,
-                    mcpServerUuid,
-                    params,
-                    namespaceUuid,
-                  );
-                  if (!fresh) {
-                    throw new Error(
-                      `Failed to re-initialize session for server ${mcpServerUuid} after backend session loss during dynamic tool routing`,
-                    );
-                  }
-                  registerListChangedSubscriber(fresh, mcpServerUuid);
-                  activeSession = fresh;
-                  pages = await listToolsOnce(activeSession);
-                }
-
-                if (matchOnPages(pages)) {
-                  // Tool exists, populate mappings for future use and use it
-                  clientForTool = activeSession;
-                  serverUuid = mcpServerUuid;
-                  toolToClient[name] = activeSession;
-                  toolToServerUuid[name] = mcpServerUuid;
-                  break;
-                }
-              } catch (error) {
-                logger.error(
-                  `Error checking tools for server ${serverName}:`,
-                  error,
-                );
-                continue;
-              }
-            }
-          }
-        }
-
-        // Reconnect-window fallback: the loop above only reaches the
-        // name-prefix check when `mcpServerPool.getSession` already has
-        // (or can immediately mint) a live connection. During an
-        // upstream reconnect, `invalidateServerConnection` tears the
-        // pooled client down and fires `list_changed` BEFORE the
-        // replacement connection exists (mcp-server-pool.ts) — a call
-        // landing in that gap sees `getSession` return `undefined` for
-        // the owning server too, so the loop never even checks its name
-        // and this would otherwise fall straight to "Unknown tool"
-        // despite the tool being real (observed as a tools/call 404
-        // during an upstream reconnect).
-        //
-        // Use the DB `toolsTable` (populated by the last successful
-        // tools/list sync) as last-known-good routing to find the
-        // owning server WITHOUT needing a live session, then give that
-        // one server a short, bounded chance to come back. Skip
-        // entirely — no wait — when the DB has no record of this tool:
-        // that's a genuinely unknown tool, not a reconnect race, and it
-        // must still 404 immediately.
-        if (!clientForTool) {
-          const candidates =
-            await namespacesRepository.findServersForNamespaceToolName(
-              namespaceUuid,
-              originalToolName,
-            );
-          const match = candidates.find(
-            (candidate) =>
-              sanitizeName(candidate.serverName || "") === serverPrefix,
-          );
-          const paramsForMatch = match
-            ? serverParams[match.serverUuid]
-            : undefined;
-
-          // No `paramsForMatch` means the server isn't in the
-          // active/non-error namespace set right now (getMcpServers
-          // already filtered it out above) — it was removed or
-          // disabled, not mid-reconnect. Don't wait for something that
-          // isn't coming back.
-          if (match && paramsForMatch) {
-            const warmupTimeoutMs =
-              await configService.getMcpToolCallReconnectWarmupTimeout();
-            const warmedSession = await acquireSessionWithBoundedWarmup({
-              pool: mcpServerPool,
-              sessionId,
-              serverUuid: match.serverUuid,
-              params: paramsForMatch,
-              namespaceUuid,
-              timeoutMs: warmupTimeoutMs,
-            });
-
-            if (
-              warmedSession &&
-              warmedSession.client.getServerCapabilities()?.tools
-            ) {
-              registerListChangedSubscriber(warmedSession, match.serverUuid);
-              clientForTool = warmedSession;
-              serverUuid = match.serverUuid;
-              toolToClient[name] = warmedSession;
-              toolToServerUuid[name] = match.serverUuid;
-            }
-          }
-        }
-      } catch (error) {
-        logger.error(`Error dynamically finding tool ${name}:`, error);
-      }
-    }
-
-    if (!clientForTool) {
-      throw new Error(`Unknown tool: ${name}`);
-    }
-
-    if (!serverUuid) {
-      throw new Error(`Server UUID not found for tool: ${name}`);
+      const serverParams = await getMcpServers(
+        namespaceUuid,
+        includeInactiveServers,
+      );
+      const route = await routeUnmappedToolCall({
+        namespaceUuid,
+        sessionId,
+        toolName: name,
+        serverPrefix,
+        originalToolName,
+        serverParams,
+        isAllowedServer,
+        toolPolicy: (context as ToolFilterCallContext).toolPolicy,
+        includeInactiveServers,
+        unknownToolMessage: `Unknown tool: ${name}`,
+        pool: mcpServerPool,
+        probe: (session, candidate) =>
+          probeServerForTool(
+            session,
+            candidate,
+            name,
+            serverPrefix,
+            originalToolName,
+          ),
+      });
+      // Idempotent; a session reached only through the fallback warm-up has
+      // not had its subscriber attached yet.
+      registerListChangedSubscriber(route.session, route.serverUuid);
+      clientForTool = route.session;
+      serverUuid = route.serverUuid;
+      toolToClient[name] = route.session;
+      toolToServerUuid[name] = route.serverUuid;
     }
 
     const abortController = new AbortController();
@@ -769,7 +1011,16 @@ export const createServer = async (
     try {
       return (await callOnce(clientForTool)) as CallToolResult;
     } catch (error) {
-      if (!isRecoverableBackendError(error)) {
+      // Replay a tools/call ONLY when the failure proves the backend never
+      // ran it: an HTTP 404 "Session not found" answer to the POST, or a
+      // transport already closed before the send. A tool call is not
+      // idempotent (a delete, a reboot, a password reset), so a timeout, a
+      // connection dropped mid-call or a 5xx surfaces to the client instead:
+      // the backend may have executed it, and a second send runs it twice.
+      // The 2026-09-30 client-side duplicate prompted finding this separate
+      // gateway retry: a 60 s timeout's -32001 read as session-lost. Do not
+      // swap this back to isRecoverableBackendError; see isToolCallReplaySafeError.
+      if (!isToolCallReplaySafeError(error)) {
         logger.error(
           `Error calling tool "${name}" through ${
             clientForTool.client.getServerVersion()?.name || "unknown"
@@ -780,38 +1031,66 @@ export const createServer = async (
       }
 
       logger.warn(
-        `Backend connection lost for server ${serverUuid} on tool "${name}"; invalidating pool and retrying once. (envelope: ${
+        `Backend connection lost for server ${serverUuid} on tool "${name}" before the call was executed; recovering the session and retrying once. (envelope: ${
           error instanceof Error ? error.message : String(error)
         })`,
       );
 
-      await mcpServerPool.invalidateServerConnection(sessionId, serverUuid);
-      delete toolToClient[name];
-
-      const serverParamsMap = await getMcpServers(
-        namespaceUuid,
-        includeInactiveServers,
-      );
-      const params = serverParamsMap[serverUuid];
-      if (!params) {
-        throw new Error(
-          `Cannot re-initialize session: server ${serverUuid} no longer present in namespace ${namespaceUuid}`,
-        );
+      // One recovery per failed client, shared by every call that fails on
+      // it, and no invalidation when that client was already retired by
+      // another recovery (session-recovery.ts). Parallel calls on a stale
+      // client used to each invalidate the server, retiring the replacement a
+      // sibling had just built and cutting calls already running on it.
+      const failedClient = clientForTool;
+      const routedServerUuid = serverUuid;
+      let freshSession: ConnectedClient | undefined;
+      try {
+        freshSession = await recoverFailedSession({
+          pool: mcpServerPool,
+          recoveries,
+          sessionId,
+          serverUuid: routedServerUuid,
+          failedClient,
+          reacquire: async () => {
+            const serverParamsMap = await getMcpServers(
+              namespaceUuid,
+              includeInactiveServers,
+            );
+            const params = serverParamsMap[routedServerUuid];
+            if (!params) {
+              throw new Error(
+                `Cannot re-initialize session: server ${routedServerUuid} no longer present in namespace ${namespaceUuid}`,
+              );
+            }
+            return await mcpServerPool.getSession(
+              sessionId,
+              routedServerUuid,
+              params,
+              namespaceUuid,
+            );
+          },
+        });
+      } catch (recoveryError) {
+        forgetRoutesTo(failedClient);
+        throw recoveryError;
       }
-
-      const freshSession = await mcpServerPool.getSession(
-        sessionId,
-        serverUuid,
-        params,
-        namespaceUuid,
-      );
       if (!freshSession) {
+        forgetRoutesTo(failedClient);
         throw new Error(
-          `Failed to re-initialize session for server ${serverUuid} after backend session loss`,
+          `Failed to re-initialize session for server ${routedServerUuid} after backend session loss`,
         );
       }
 
-      registerListChangedSubscriber(freshSession, serverUuid);
+      registerListChangedSubscriber(freshSession, routedServerUuid);
+      // Replace, never delete-then-set: a call arriving while the recovery
+      // ran found the old route, failed on the dead client and joined this
+      // same recovery, instead of finding no route and taking the dynamic
+      // lookup. Every route that pointed at the dead client moves over.
+      for (const [routedName, routedClient] of Object.entries(toolToClient)) {
+        if (routedClient === failedClient) {
+          toolToClient[routedName] = freshSession;
+        }
+      }
       toolToClient[name] = freshSession;
 
       try {
@@ -842,20 +1121,49 @@ export const createServer = async (
 
   const callToolWithMiddleware = compose(
     // Outermost: records every call (incl. denied) to the Live Logs store.
-    createAuditingMiddleware(),
+    createAuditingMiddleware((name) => toolArgSchemas.get(name)),
+    // Second, OUTSIDE the filter so it also sees the filter's fail-closed
+    // denial for a deleted server: answers a call that already failed as an
+    // unknown tool with the replacement from the retired-tool map. Consulted
+    // only AFTER a failure, so it cannot shadow a live tool.
+    createRetiredToolMiddleware(),
+    // Override names resolve BEFORE the filter, so the INACTIVE check judges
+    // the tool that will actually run. With the filter outside this, a call
+    // by an override name (`<server>__<alias>`) reached the filter as the
+    // alias, found no mapping row for it, read that as "allowed", and was then
+    // routed to the original tool, so a tool curated INACTIVE stayed callable
+    // by its alias while its real name was refused. This mirrors the list
+    // chain above, where the filter also runs on the real names, inside the
+    // rename. A name that is not an override passes this middleware unchanged,
+    // so the filter sees exactly the name it saw before; an alias call is
+    // refused with the same text its real name gets (it names the real tool).
+    createToolOverridesCallToolMiddleware({ cacheEnabled: true }),
     createFilterCallToolMiddleware({
       cacheEnabled: true,
       customErrorMessage: (toolName, reason) =>
         `Access denied to tool "${toolName}": ${reason}`,
     }),
-    createToolOverridesCallToolMiddleware({ cacheEnabled: true }),
+    // Innermost, directly around the routing handler: adds text to the
+    // SDK-shaped -32001 timeout saying the outcome is unknown and a write's
+    // target should be read before a retry. Same code, same data; text only.
+    createTimeoutHintMiddleware(),
     // Add more middleware here as needed
     // createAuthorizationMiddleware(),
   )(originalCallToolHandler);
 
   // Set up the handlers with middleware
   server.setRequestHandler(ListToolsRequestSchema, async (request) => {
-    return await listToolsWithMiddleware(request, handlerContext);
+    const generation = ++toolSchemaGeneration;
+    toolArgSchemas.replace([]);
+    const result = await listToolsWithMiddleware(request, handlerContext);
+    // Use final names after filters and overrides, and discard removed names.
+    // Another proxy's listing cannot teach this routing instance a schema.
+    // A notification or overlapping listing makes an older response unsafe to
+    // retain. Counts-only is honest until a fresh uncontested listing arrives.
+    toolArgSchemas.replace(
+      generation === toolSchemaGeneration ? result.tools : [],
+    );
+    return result;
   });
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -1352,6 +1660,7 @@ export const createServer = async (
   );
 
   const cleanup = async () => {
+    stopOwedServerWatches();
     // Cleanup is now handled by the pool
     await mcpServerPool.cleanupSession(sessionId);
   };

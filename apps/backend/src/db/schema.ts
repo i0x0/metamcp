@@ -7,6 +7,7 @@ import {
   McpServerErrorStatusEnum,
   McpServerStatusEnum,
   McpServerTypeEnum,
+  type NamespaceToolPolicy,
   type OAuthClientRegistrationSource,
 } from "@repo/zod-types";
 import { sql } from "drizzle-orm";
@@ -25,6 +26,8 @@ import {
   unique,
   uuid,
 } from "drizzle-orm/pg-core";
+
+import type { ArgsShape } from "../lib/metamcp/metamcp-middleware/audit-args-shape";
 
 // Build the drizzle enums from the shared literal tuples (not
 // `SomeEnum.options`, which zod 4 widens to string[] and breaks pgEnum's
@@ -280,6 +283,16 @@ export const namespacesTable = pgTable(
     user_id: text("user_id").references(() => usersTable.id, {
       onDelete: "cascade",
     }),
+    // How the tool filter treats a tool with NO namespace_tool_mappings row
+    // (migration 0040): 'allow_all' serves it (the original behaviour, and the
+    // default, so the column's arrival changes nothing), 'allowlist' hides it,
+    // so only ACTIVE rows are listed or callable. Text plus the CHECK below
+    // rather than a pgEnum; the reasoning is in the migration. Written only by
+    // the admin-gated `namespaces.setToolPolicy`.
+    tool_policy: text("tool_policy")
+      .$type<NamespaceToolPolicy>()
+      .notNull()
+      .default("allow_all"),
   },
   (table) => [
     index("namespaces_user_id_idx").on(table.user_id),
@@ -288,6 +301,12 @@ export const namespacesTable = pgTable(
     sql`CONSTRAINT namespaces_name_regex_check CHECK (
         name ~ '^[a-zA-Z0-9_-]+$'
       )`,
+    // Mirrored from migration 0040 so a fresh `drizzle-kit generate` re-adds
+    // nothing; refuses any other value even on a row written outside the app.
+    check(
+      "namespaces_tool_policy_check",
+      sql`${table.tool_policy} IN ('allow_all', 'allowlist')`,
+    ),
   ],
 );
 
@@ -505,6 +524,17 @@ export const apiKeysTable = pgTable(
     // control-plane key cannot reach the data plane and vice versa. NOT NULL
     // default false so the deploy is inert and no live key changes behaviour.
     admin_plane: boolean("admin_plane").notNull().default(false),
+    // IP allowlist (migration 0041). NULL = the key has no list of its own and
+    // follows the GLOBAL policy (config rows API_KEY_IP_ALLOWED_CIDRS and
+    // API_KEY_IP_POLICY_MODE). Non-NULL (even empty) = the key's own list, and
+    // its own ip_policy_mode applies. See lib/api-key-ip-policy.ts.
+    allowed_cidrs: text("allowed_cidrs").array(),
+    // off | audit | enforce (CHECK below). Read only when allowed_cidrs is
+    // non-NULL. Default 'off' so the deploy is inert.
+    ip_policy_mode: text("ip_policy_mode").notNull().default("off"),
+    // CF-Connecting-IP of the last authenticated request, written in the same
+    // throttled stamp as last_used_at. Admin view only.
+    last_used_ip: text("last_used_ip"),
   },
   (table) => [
     index("api_keys_user_id_idx").on(table.user_id),
@@ -548,6 +578,12 @@ export const apiKeysTable = pgTable(
     check(
       "api_keys_admin_plane_no_acts_as",
       sql`${table.admin_plane} = false OR ${table.acts_as_user_id} IS NULL`,
+    ),
+    // IP policy mode (migration 0041): a row written outside the app cannot
+    // carry a mode the evaluator does not know.
+    check(
+      "api_keys_ip_policy_mode_valid",
+      sql`${table.ip_policy_mode} IN ('off', 'audit', 'enforce')`,
     ),
   ],
 );
@@ -947,6 +983,21 @@ export const toolCallAuditTable = pgTable(
     acts_as_user_id: text("acts_as_user_id"),
     caller_ip: text("caller_ip"),
     request_id: text("request_id"),
+    // Migration 0039. Both NULLABLE, unconstrained and unindexed, for the same
+    // reason as the 0030 columns above: the write is fire-and-forget and a
+    // violation would be a swallowed INSERT failure, i.e. a silently missing
+    // audit row. NULL means "not recorded" (every row before the migration,
+    // or the kill switch was off); the table is write-once (0032), so it cannot
+    // be backfilled.
+    //
+    // `args_shape` is the SHAPE of the call: top-level key names plus the value
+    // of six allowlisted selector keys, never any other argument value (see
+    // lib/metamcp/metamcp-middleware/audit-args-shape).
+    // `error_detail` is the tool's own failure code token beside the
+    // `error_code` class (see audit-classify). Type-only import: this module
+    // must stay free of any runtime dependency on lib/.
+    args_shape: jsonb("args_shape").$type<ArgsShape>(),
+    error_detail: text("error_detail"),
   },
   (table) => [
     index("tool_call_audit_called_at_idx").on(table.called_at),

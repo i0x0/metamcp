@@ -31,8 +31,14 @@ import type { CeilingDecision } from "./credential-session-quota";
 import { metamcpLogStore } from "./log-store";
 import type { SessionIdentity } from "./session-auth";
 
-/** Which ceiling condition an event describes. Part of the throttle key. */
-type SessionCeilingEventKind = "refused" | "approaching";
+/**
+ * Which ceiling condition an event describes. Part of the throttle key.
+ * `evicted`: the credential was at its ceiling and an idle session was evicted
+ * so a new session could be admitted (`checkConcurrentSessionCeiling`) or a
+ * returning one recovered (`checkConcurrentSessionCeilingForRecovery`). Both
+ * share the kind, and so the throttle window; only the message says which.
+ */
+type SessionCeilingEventKind = "refused" | "evicted" | "approaching";
 
 /**
  * One event per (credential, endpoint, kind) per interval; suppressed
@@ -96,28 +102,50 @@ export function __resetSessionCeilingThrottleForTesting(): void {
 
 function buildMessage(
   kind: SessionCeilingEventKind,
-  current: number,
-  ceiling: number,
+  decision: CeilingDecision,
   suppressed: number,
 ): string {
+  const { current, ceiling, eviction, liveSummary } = decision;
+  // A lazy recovery admits no NEW session, so its eviction must not say it
+  // did. The log line keeps one wording for both (the Grafana ceiling rule
+  // matches it); this event is read by a person, so it says which it was.
+  const admitted =
+    eviction?.purpose === "recovery" ? "a recovered session" : "a new session";
   const base =
     kind === "refused"
       ? `session refused: concurrent-session ceiling reached (${current}/${ceiling})`
-      : `concurrent sessions at ${current}/${ceiling}, approaching the ceiling`;
-  if (suppressed <= 0) {
-    return base;
-  }
-  const noun = kind === "refused" ? "refusals" : "warnings";
-  return `${base} (${suppressed} more ${noun} suppressed in the last 60s)`;
+      : kind === "evicted"
+        ? `idle session evicted to admit ${admitted} at the concurrent-session ceiling (${current}/${ceiling})` +
+          (eviction
+            ? `: ${eviction.endpointName}, idle ${eviction.idleSeconds}s`
+            : "")
+        : `concurrent sessions at ${current}/${ceiling}, approaching the ceiling`;
+  const noun =
+    kind === "refused"
+      ? "refusals"
+      : kind === "evicted"
+        ? "evictions"
+        : "warnings";
+  const withSuppressed =
+    suppressed <= 0
+      ? base
+      : `${base} (${suppressed} more ${noun} suppressed in the last 60s)`;
+  // The summary says WHAT fills the credential (endpoint names and counts only,
+  // never a session id). Appended last so the existing prefix is unchanged.
+  return liveSummary ? `${withSuppressed}; ${liveSummary}` : withSuppressed;
 }
 
 /**
  * Record a durable, throttled ceiling event for one session-creation decision.
  *
  * Call once per decision at each refusal site, right after
- * `checkConcurrentSessionCeiling`. Emits a `refused` event when the decision
- * refused, an `approaching` event when it allowed but the credential is at or
- * past the 80% WARN threshold, and nothing otherwise. `label` is the
+ * `checkConcurrentSessionCeiling`, and for a lazy recovery's decision when it
+ * evicted. Emits a `refused` event when the decision refused, an `evicted`
+ * event when it admitted (a new session, or a recovered one) by evicting an
+ * idle session, an `approaching` event when it allowed but the credential is
+ * at or past the 80% WARN threshold, and nothing otherwise. The `evicted` event is `info`, not
+ * `warn`: nothing was turned away, which keeps a refusal the only `warn`
+ * outcome at the ceiling. `label` is the
  * credential's DISPLAY NAME (api-key name or OAuth user email) — never a token,
  * key value, or header — and rides `clientName` so the History view names WHICH
  * credential without exposing a secret. The 429 response body is unaffected;
@@ -134,9 +162,11 @@ export function recordSessionCeilingEvent(params: {
 
     const kind: SessionCeilingEventKind | null = !decision.allowed
       ? "refused"
-      : decision.approaching
-        ? "approaching"
-        : null;
+      : decision.eviction
+        ? "evicted"
+        : decision.approaching
+          ? "approaching"
+          : null;
     if (kind === null) {
       return;
     }
@@ -157,13 +187,8 @@ export function recordSessionCeilingEvent(params: {
     metamcpLogStore.record({
       category: "client",
       serverName: endpointName,
-      level: "warn",
-      message: buildMessage(
-        kind,
-        decision.current,
-        decision.ceiling,
-        suppressed,
-      ),
+      level: kind === "evicted" ? "info" : "warn",
+      message: buildMessage(kind, decision, suppressed),
       clientName: label,
     });
   } catch {

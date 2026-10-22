@@ -16,7 +16,15 @@
  * unit-under-test here is the invalidation surface.
  */
 
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  type MockInstance,
+  vi,
+} from "vitest";
 
 // `mcp-server-pool.ts` instantiates a `connectMetaMcpClient` -driven
 // pool at module load time. Stub the heavy imports so the unit test
@@ -49,7 +57,11 @@ vi.mock("./server-error-tracker", () => ({
   },
 }));
 
-import { McpServerPool } from "./mcp-server-pool";
+import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
+
+import logger from "@/utils/logger";
+
+import { isPingAnsweredError, McpServerPool } from "./mcp-server-pool";
 import { toolsSyncCache } from "./tools-sync-cache";
 
 // Bypass the private-constructor discipline once, file-wide, without a
@@ -315,6 +327,61 @@ describe("McpServerPool.invalidateServerConnection — cascade across sessions",
 //      failure).
 // -------------------------------------------------------------------
 
+describe("McpServerPool.isPooledClient", () => {
+  let pool: McpServerPool;
+  let internals: {
+    activeSessions: Record<string, Record<string, FakeClient>>;
+    idleSessions: Record<string, FakeClient>;
+    sessionToServers: Record<string, Set<string>>;
+    creatingIdleSessions: Set<string>;
+  };
+
+  beforeEach(() => {
+    pool = new PoolConstructor();
+    internals = pool as any;
+    internals.activeSessions = {};
+    internals.idleSessions = {};
+    internals.sessionToServers = {};
+    internals.creatingIdleSessions = new Set();
+  });
+
+  it("is true for a client in any session's active slot or in the idle slot", () => {
+    const active = makeFakeClient();
+    const idle = makeFakeClient();
+    internals.activeSessions["session-B"] = { "server-1": active };
+    internals.idleSessions["server-1"] = idle;
+
+    expect(pool.isPooledClient("server-1", active as never)).toBe(true);
+    expect(pool.isPooledClient("server-1", idle as never)).toBe(true);
+  });
+
+  it("is false for the same client under another server, and for a stranger", () => {
+    const active = makeFakeClient();
+    internals.activeSessions["session-A"] = { "server-1": active };
+
+    expect(pool.isPooledClient("server-2", active as never)).toBe(false);
+    expect(pool.isPooledClient("server-1", makeFakeClient() as never)).toBe(
+      false,
+    );
+  });
+
+  it("is false for every client an invalidation retired", async () => {
+    const a = makeFakeClient();
+    const b = makeFakeClient();
+    internals.activeSessions["session-A"] = { "server-1": a };
+    internals.activeSessions["session-B"] = { "server-1": b };
+    internals.sessionToServers["session-A"] = new Set(["server-1"]);
+    internals.sessionToServers["session-B"] = new Set(["server-1"]);
+
+    await pool.invalidateServerConnection("session-A", "server-1");
+
+    // A recovery in session B now knows its client was already retired and
+    // must not cascade a second time.
+    expect(pool.isPooledClient("server-1", a as never)).toBe(false);
+    expect(pool.isPooledClient("server-1", b as never)).toBe(false);
+  });
+});
+
 describe("McpServerPool.handleTransportDrop — recovery cascade", () => {
   let pool: McpServerPool;
   let internals: {
@@ -412,12 +479,17 @@ describe("McpServerPool.handleTransportDrop — recovery cascade", () => {
 //
 // Before this, `maxTotalConnections` was a HARD refuse. Under
 // persistent sessions (sessionLifetime=null) cleanupExpiredSessions
-// no-ops and cleanupSession RECYCLES active→idle, so the idle pool
-// grows until the cap is hit — then EVERY new connection is refused,
-// including the recreation a backend needs after a Watchtower restart.
-// The pool deadlocked on "connection limit reached" until a manual
-// `docker restart metamcp` (observed against a live deployment: a
-// backend stayed wedged for minutes after a redeploy).
+// no-ops, so active sessions that clients never close keep their
+// connections until the pool reaches the cap, and then EVERY new
+// connection was refused, including the recreation a backend needs
+// after a Watchtower restart. The idle pool is NOT where that
+// accumulation happens: idleSessions holds at most one connection per
+// server (every writer checks for an existing entry, and
+// cleanupSession destroys a recycled connection when its server
+// already has an idle one). The pool deadlocked on "connection limit
+// reached" until a manual `docker restart metamcp` (observed against
+// a live deployment: a backend stayed wedged for minutes after a
+// redeploy).
 //
 // evictOneForCapacity reclaims one slot by DESTROYING (not recycling)
 // the least-valuable connection: idle first, then oldest active.
@@ -508,6 +580,208 @@ describe("McpServerPool.evictOneForCapacity — LRU eviction at the cap", () => 
   it("returns false when the pool is empty (nothing to evict)", async () => {
     const freed = await internals.evictOneForCapacity("server-1");
     expect(freed).toBe(false);
+  });
+});
+
+// -------------------------------------------------------------------
+// Refusal wording at the cap
+//
+// `canCreateConnection` used to log "Connection limit reached ...
+// Refusing to create new connection." itself, BEFORE createNewConnection
+// ran evictOneForCapacity. A connection that eviction then admitted
+// therefore read as a refusal in the logs, and an operator grepping
+// "Refusing" during an incident saw refusals that never happened. The
+// refusal line now fires only once eviction has failed (or a concurrent
+// creator re-filled the freed slot). The "Pool at cap" WARN from
+// evictOneForCapacity is the saturation signal and must stay.
+// -------------------------------------------------------------------
+describe("McpServerPool.createNewConnection: refusal logged only when eviction fails", () => {
+  type CapInternals = {
+    activeSessions: Record<string, Record<string, FakeClient>>;
+    idleSessions: Record<string, FakeClient>;
+    sessionToServers: Record<string, Set<string>>;
+    sessionTimestamps: Record<string, number>;
+    maxTotalConnections: number;
+    evictOneForCapacity: (forServerUuid: string) => Promise<boolean>;
+    createNewConnection: (params: {
+      uuid: string;
+      name: string;
+    }) => Promise<unknown>;
+  };
+
+  let pool: McpServerPool;
+  let internals: CapInternals;
+  let connectMock: ReturnType<typeof vi.fn>;
+  let warnSpy: MockInstance<typeof logger.warn>;
+
+  const warnMessages = (): string[] =>
+    warnSpy.mock.calls.map((call) => String(call[0]));
+  const refusalLines = (): string[] =>
+    warnMessages().filter((m) => m.includes("Refusing to create"));
+  const skipLines = (): string[] =>
+    warnMessages().filter((m) => m.startsWith("Skipping connection"));
+  const poolAtCapLines = (): string[] =>
+    warnMessages().filter((m) => m.startsWith("Pool at cap"));
+
+  beforeEach(async () => {
+    pool = new PoolConstructor();
+    internals = pool as never;
+    internals.activeSessions = {};
+    internals.idleSessions = {};
+    internals.sessionToServers = {};
+    internals.sessionTimestamps = {};
+    connectMock = (await import("./client"))
+      .connectMetaMcpClient as unknown as ReturnType<typeof vi.fn>;
+    connectMock.mockReset();
+    connectMock.mockResolvedValue({ client: {}, cleanup: vi.fn() });
+    warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    warnSpy.mockRestore();
+  });
+
+  it("logs no refusal and no skip when evicting an idle session admits the connection", async () => {
+    internals.maxTotalConnections = 2;
+    const idleOther = makeFakeClient();
+    internals.idleSessions["server-A"] = idleOther as never;
+    internals.idleSessions["server-B"] = makeFakeClient() as never;
+
+    const result = await internals.createNewConnection({
+      uuid: "server-C",
+      name: "backend-c",
+    });
+
+    expect(result).toBeDefined();
+    expect(connectMock).toHaveBeenCalledTimes(1);
+    expect(idleOther.cleanup).toHaveBeenCalledTimes(1);
+    expect(refusalLines()).toEqual([]);
+    expect(skipLines()).toEqual([]);
+    // The saturation signal (METAMCP-POOL-1 soak criterion) is unchanged.
+    expect(poolAtCapLines()).toEqual([
+      "Pool at cap (2); destroying idle session for server-A to admit server-C",
+    ]);
+  });
+
+  it("logs no refusal and no skip when evicting an active connection admits the connection", async () => {
+    internals.maxTotalConnections = 2;
+    const cOld = makeFakeClient();
+    internals.activeSessions["session-old"] = { "server-A": cOld as never };
+    internals.activeSessions["session-new"] = {
+      "server-B": makeFakeClient() as never,
+    };
+    internals.sessionToServers["session-old"] = new Set(["server-A"]);
+    internals.sessionToServers["session-new"] = new Set(["server-B"]);
+    internals.sessionTimestamps["session-old"] = 1000;
+    internals.sessionTimestamps["session-new"] = 2000;
+
+    const result = await internals.createNewConnection({
+      uuid: "server-C",
+      name: "backend-c",
+    });
+
+    expect(result).toBeDefined();
+    expect(cOld.cleanup).toHaveBeenCalledTimes(1);
+    expect(refusalLines()).toEqual([]);
+    expect(skipLines()).toEqual([]);
+    expect(poolAtCapLines()).toEqual([
+      "Pool at cap (2) with no idle slots; destroying oldest active connection session-old/server-A to admit server-C",
+    ]);
+  });
+
+  it("logs nothing below the cap", async () => {
+    internals.maxTotalConnections = 5;
+    internals.idleSessions["server-A"] = makeFakeClient() as never;
+
+    const result = await internals.createNewConnection({
+      uuid: "server-C",
+      name: "backend-c",
+    });
+
+    expect(result).toBeDefined();
+    expect(warnMessages()).toEqual([]);
+  });
+
+  it("treats a NaN cap (malformed MAX_TOTAL_CONNECTIONS) as uncapped: admits, evicts nothing, logs nothing", async () => {
+    internals.maxTotalConnections = Number.NaN;
+    const idle = makeFakeClient();
+    internals.idleSessions["server-A"] = idle as never;
+
+    const result = await internals.createNewConnection({
+      uuid: "server-C",
+      name: "backend-c",
+    });
+
+    expect(result).toBeDefined();
+    expect(connectMock).toHaveBeenCalledTimes(1);
+    expect(idle.cleanup).not.toHaveBeenCalled();
+    expect(warnMessages()).toEqual([]);
+  });
+
+  it("logs the refusal with its total/cap context when eviction cannot free a slot", async () => {
+    // The only connection at the cap belongs to the server being admitted,
+    // and eviction never takes the admitted server's own connection.
+    internals.maxTotalConnections = 1;
+    const cSelf = makeFakeClient();
+    internals.activeSessions["session-A"] = { "server-C": cSelf as never };
+    internals.sessionToServers["session-A"] = new Set(["server-C"]);
+    internals.sessionTimestamps["session-A"] = 1000;
+    const realEvict = internals.evictOneForCapacity.bind(pool);
+    const evictSpy = vi.fn(realEvict);
+    internals.evictOneForCapacity = evictSpy;
+
+    const result = await internals.createNewConnection({
+      uuid: "server-C",
+      name: "backend-c",
+    });
+
+    expect(result).toBeUndefined();
+    expect(connectMock).not.toHaveBeenCalled();
+    expect(cSelf.cleanup).not.toHaveBeenCalled();
+    expect(refusalLines()).toEqual([
+      "Connection limit reached: 1/1. Refusing to create new connection.",
+    ]);
+    expect(skipLines()).toEqual([
+      "Skipping connection for server backend-c (server-C) - connection limit reached",
+    ]);
+    expect(poolAtCapLines()).toEqual([]);
+
+    // The refusal is a verdict on a failed eviction, so it must be logged
+    // AFTER eviction was attempted, never before it.
+    expect(evictSpy).toHaveBeenCalledTimes(1);
+    const refusalCallIndex = warnMessages().findIndex((m) =>
+      m.includes("Refusing to create"),
+    );
+    expect(evictSpy.mock.invocationCallOrder[0]).toBeLessThan(
+      warnSpy.mock.invocationCallOrder[refusalCallIndex],
+    );
+  });
+
+  it("logs the refusal when eviction frees a slot but a concurrent creator re-fills it", async () => {
+    // evictOneForCapacity awaits the victim's cleanup, so another creator
+    // can take the freed slot before createNewConnection re-checks. The
+    // connection really is refused in that case, and the log must say so.
+    internals.maxTotalConnections = 1;
+    internals.idleSessions["server-A"] = makeFakeClient() as never;
+    const realEvict = internals.evictOneForCapacity.bind(pool);
+    internals.evictOneForCapacity = vi.fn(async (forServerUuid: string) => {
+      const freed = await realEvict(forServerUuid);
+      internals.idleSessions["server-late"] = makeFakeClient() as never;
+      return freed;
+    });
+
+    const result = await internals.createNewConnection({
+      uuid: "server-C",
+      name: "backend-c",
+    });
+
+    expect(result).toBeUndefined();
+    expect(connectMock).not.toHaveBeenCalled();
+    expect(refusalLines()).toEqual([
+      "Connection limit reached: 1/1. Refusing to create new connection.",
+    ]);
+    expect(skipLines()).toHaveLength(1);
+    expect(poolAtCapLines()).toHaveLength(1);
   });
 });
 
@@ -1221,5 +1495,317 @@ describe("McpServerPool tool-sweep timer lifecycle", () => {
         process.env.TOOLS_SWEEP_INTERVAL_SECONDS = prev;
       }
     }
+  });
+});
+
+describe("health checks: a -32601 answer to ping is alive (upstream #337)", () => {
+  // `ping` is optional in the MCP spec. A backend that does not implement it
+  // answers -32601 "Method not found", which is a reply over a working
+  // connection. Before this, the idle check recreated such a backend's idle
+  // connection every sweep and the active check cascade-invalidated it every
+  // second sweep, forever.
+
+  const methodNotFound = () =>
+    new McpError(ErrorCode.MethodNotFound, "Method not found");
+  const timedOut = () =>
+    new McpError(ErrorCode.RequestTimeout, "Request timed out");
+
+  type PingClient = FakeClient & {
+    client: { ping: ReturnType<typeof vi.fn> };
+  };
+
+  function makeClientRejectingWith(error: unknown): PingClient {
+    const fake = makeFakeClient() as PingClient;
+    fake.client = { ping: vi.fn().mockRejectedValue(error) };
+    return fake;
+  }
+
+  let pool: McpServerPool;
+  let internals: {
+    activeSessions: Record<string, Record<string, PingClient>>;
+    idleSessions: Record<string, PingClient>;
+    sessionToServers: Record<string, Set<string>>;
+    creatingIdleSessions: Set<string>;
+    serverParamsCache: Record<string, unknown>;
+    activePingFailures: Record<string, number>;
+    checkIdleSessionHealth: () => Promise<void>;
+    checkActiveSessionHealth: () => Promise<void>;
+  };
+  let createIdleSpy: ReturnType<typeof vi.fn>;
+
+  beforeEach(async () => {
+    pool = new PoolConstructor();
+    internals = pool as never;
+    internals.activeSessions = {};
+    internals.idleSessions = {};
+    internals.sessionToServers = {};
+    internals.creatingIdleSessions = new Set();
+    internals.serverParamsCache = {
+      "server-1": { uuid: "server-1", name: "no-ping-backend" },
+    };
+    internals.activePingFailures = {};
+    const tracker = (await import("./server-error-tracker"))
+      .serverErrorTracker as never as {
+      isServerInErrorState: ReturnType<typeof vi.fn>;
+      resetServerErrorState: ReturnType<typeof vi.fn>;
+    };
+    tracker.isServerInErrorState.mockReset().mockResolvedValue(false);
+    tracker.resetServerErrorState.mockReset();
+    createIdleSpy = vi.fn();
+    (
+      pool as never as { createIdleSessionAsync: unknown }
+    ).createIdleSessionAsync = createIdleSpy;
+  });
+
+  afterEach(async () => {
+    await pool.cleanupAll();
+  });
+
+  describe("isPingAnsweredError", () => {
+    it("is true only for the numeric -32601 the SDK sets on an error response", () => {
+      expect(isPingAnsweredError(methodNotFound())).toBe(true);
+      expect(isPingAnsweredError({ code: -32601 })).toBe(true);
+    });
+
+    it.each([
+      ["a timeout", new McpError(ErrorCode.RequestTimeout, "timed out")],
+      [
+        "a closed connection",
+        new McpError(ErrorCode.ConnectionClosed, "closed"),
+      ],
+      ["a plain Error naming the method", new Error("Method not found")],
+      ["a string code", { code: "-32601" }],
+      [
+        "a timeout whose text mentions ping",
+        new Error("timeout waiting for ping response"),
+      ],
+      ["null", null],
+      ["undefined", undefined],
+    ])("is false for %s", (_label, error) => {
+      expect(isPingAnsweredError(error)).toBe(false);
+    });
+  });
+
+  describe("idle check", () => {
+    it("keeps an idle connection whose backend answered -32601", async () => {
+      const idle = makeClientRejectingWith(methodNotFound());
+      internals.idleSessions["server-1"] = idle;
+
+      await internals.checkIdleSessionHealth();
+      await internals.checkIdleSessionHealth();
+
+      expect(idle.client.ping).toHaveBeenCalledTimes(2);
+      expect(internals.idleSessions["server-1"]).toBe(idle);
+      expect(idle.cleanup).not.toHaveBeenCalled();
+      expect(createIdleSpy).not.toHaveBeenCalled();
+    });
+
+    it("still retires and recreates an idle connection whose ping timed out", async () => {
+      const idle = makeClientRejectingWith(timedOut());
+      internals.idleSessions["server-1"] = idle;
+
+      await internals.checkIdleSessionHealth();
+
+      expect(internals.idleSessions["server-1"]).toBeUndefined();
+      expect(idle.cleanup).toHaveBeenCalledTimes(1);
+      expect(createIdleSpy).toHaveBeenCalledWith(
+        "server-1",
+        internals.serverParamsCache["server-1"],
+      );
+    });
+  });
+
+  describe("active check", () => {
+    it("takes no strike and evicts nothing for a -32601 answer", async () => {
+      const active = makeClientRejectingWith(methodNotFound());
+      internals.activeSessions["session-A"] = { "server-1": active };
+      internals.sessionToServers["session-A"] = new Set(["server-1"]);
+      internals.activePingFailures["server-1"] = 1; // a prior strike clears
+
+      await internals.checkActiveSessionHealth();
+      await internals.checkActiveSessionHealth();
+
+      expect(active.client.ping).toHaveBeenCalledTimes(2);
+      expect(internals.activePingFailures["server-1"]).toBeUndefined();
+      expect(active.cleanup).not.toHaveBeenCalled();
+      expect(internals.activeSessions["session-A"]["server-1"]).toBe(active);
+    });
+
+    it("still counts a dead sibling of an answering connection", async () => {
+      const answering = makeClientRejectingWith(methodNotFound());
+      const dead = makeClientRejectingWith(timedOut());
+      internals.activeSessions["session-A"] = { "server-1": answering };
+      internals.activeSessions["session-B"] = { "server-1": dead };
+      internals.sessionToServers["session-A"] = new Set(["server-1"]);
+      internals.sessionToServers["session-B"] = new Set(["server-1"]);
+
+      await internals.checkActiveSessionHealth();
+
+      expect(internals.activePingFailures["server-1"]).toBe(1);
+    });
+  });
+});
+
+// -------------------------------------------------------------------
+// tools/list re-notify probe (tools-list-renotify.ts)
+//
+// A session whose tools/list left a backend out is owed a list_changed once
+// that backend lists again. The pool answers "does it list now" over a real
+// pooled connection (without moving its ownership), and every successful
+// connect tells the watch to probe at once.
+// -------------------------------------------------------------------
+describe("McpServerPool.probeServerTools — the re-notify probe", () => {
+  type ProbeInternals = {
+    idleSessions: Record<string, unknown>;
+    activeSessions: Record<string, Record<string, unknown>>;
+    sessionTimestamps: Record<string, number>;
+    maxConnectionsPerServer: number;
+    cleanupAllPromise: Promise<void> | null;
+    markServerSuccess: (serverUuid: string) => void;
+  };
+
+  const params = { uuid: "server-1", name: "ninja" } as never;
+
+  let pool: McpServerPool;
+  let internals: ProbeInternals;
+  let connectMock: ReturnType<typeof vi.fn>;
+
+  const fakeConnected = (request: ReturnType<typeof vi.fn>) => ({
+    client: { request },
+    cleanup: vi.fn(async () => undefined),
+    listChangedSubscribers: new Set(),
+  });
+
+  beforeEach(async () => {
+    pool = new PoolConstructor();
+    internals = pool as never;
+    connectMock = (await import("./client"))
+      .connectMetaMcpClient as unknown as ReturnType<typeof vi.fn>;
+    connectMock.mockReset();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    void pool.cleanupAll();
+  });
+
+  it("connects an idle session when the slot is empty and answers true once tools/list answers", async () => {
+    const request = vi.fn().mockResolvedValue({ tools: [] });
+    connectMock.mockResolvedValue(fakeConnected(request));
+
+    await expect(pool.probeServerTools(params, "ns-1")).resolves.toBe(true);
+
+    expect(connectMock).toHaveBeenCalledTimes(1);
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(request.mock.calls[0][0]).toEqual({
+      method: "tools/list",
+      params: {},
+    });
+    // Bounded, so a slow backend cannot hold the probe loop.
+    expect(request.mock.calls[0][2]).toEqual({ timeout: 10000 });
+    // The connection stays pooled as the idle slot for the re-list to use.
+    expect(internals.idleSessions["server-1"]).toBeDefined();
+    expect(internals.activeSessions).toEqual({});
+  });
+
+  it("reuses an existing idle connection without connecting", async () => {
+    const request = vi.fn().mockResolvedValue({ tools: [] });
+    internals.idleSessions["server-1"] = fakeConnected(request);
+
+    await expect(pool.probeServerTools(params)).resolves.toBe(true);
+    expect(connectMock).not.toHaveBeenCalled();
+  });
+
+  it("probes an existing active connection when the per-server cap leaves no idle slot", async () => {
+    const request = vi.fn().mockResolvedValue({ tools: [] });
+    const active = fakeConnected(request);
+    internals.activeSessions["sess-1"] = { "server-1": active };
+    internals.sessionTimestamps["sess-1"] = Date.now();
+    internals.maxConnectionsPerServer = 1;
+
+    await expect(pool.probeServerTools(params)).resolves.toBe(true);
+    expect(connectMock).not.toHaveBeenCalled();
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(internals.activeSessions["sess-1"]["server-1"]).toBe(active);
+    expect(internals.idleSessions["server-1"]).toBeUndefined();
+  });
+
+  it("accepts a reply if its idle connection was adopted by a session during the probe", async () => {
+    let resolve!: (value: { tools: [] }) => void;
+    const request = vi.fn(
+      () => new Promise<{ tools: [] }>((res) => (resolve = res)),
+    );
+    const active = fakeConnected(request);
+    internals.idleSessions["server-1"] = active;
+    const probing = pool.probeServerTools(params);
+    delete internals.idleSessions["server-1"];
+    internals.activeSessions["sess-1"] = { "server-1": active };
+    resolve({ tools: [] });
+    await expect(probing).resolves.toBe(true);
+  });
+
+  it("answers false, without throwing, when the connect fails", async () => {
+    connectMock.mockResolvedValue(undefined);
+    await expect(pool.probeServerTools(params)).resolves.toBe(false);
+  });
+
+  it("answers false when tools/list fails over a connection from before a restart", async () => {
+    const request = vi
+      .fn()
+      .mockRejectedValue(new McpError(-32000, "Connection closed"));
+    internals.idleSessions["server-1"] = fakeConnected(request);
+    await expect(pool.probeServerTools(params)).resolves.toBe(false);
+  });
+
+  it.each(["result", "method-not-found"])(
+    "does not report recovery from an invalidated connection's late %s",
+    async (answer) => {
+      let resolve!: (value: { tools: [] }) => void;
+      let reject!: (error: unknown) => void;
+      const request = vi.fn(
+        () =>
+          new Promise<{ tools: [] }>((res, rej) => {
+            resolve = res;
+            reject = rej;
+          }),
+      );
+      internals.idleSessions["server-1"] = fakeConnected(request);
+      const probing = pool.probeServerTools(params);
+      expect(request).toHaveBeenCalledTimes(1);
+
+      // The backend drops while tools/list is pending. Its old reply must
+      // not discharge watchers waiting for the replacement to answer.
+      await pool.invalidateServerConnection("sess-1", "server-1");
+      if (answer === "result") {
+        resolve({ tools: [] });
+      } else {
+        reject(new McpError(ErrorCode.MethodNotFound, "Method not found"));
+      }
+      await expect(probing).resolves.toBe(false);
+    },
+  );
+
+  it("counts a -32601 answer (a backend with no tools) as answering", async () => {
+    const request = vi
+      .fn()
+      .mockRejectedValue(
+        new McpError(ErrorCode.MethodNotFound, "Method not found"),
+      );
+    internals.idleSessions["server-1"] = fakeConnected(request);
+    await expect(pool.probeServerTools(params)).resolves.toBe(true);
+  });
+
+  it("answers false while the pool is shutting down", async () => {
+    internals.cleanupAllPromise = Promise.resolve();
+    await expect(pool.probeServerTools(params)).resolves.toBe(false);
+    expect(connectMock).not.toHaveBeenCalled();
+    internals.cleanupAllPromise = null;
+  });
+
+  it("tells the re-notify watch on every successful connect", async () => {
+    const { toolsListRenotifyWatch } = await import("./tools-list-renotify");
+    const notify = vi.spyOn(toolsListRenotifyWatch, "notifyConnected");
+    internals.markServerSuccess("server-9");
+    expect(notify).toHaveBeenCalledWith("server-9");
   });
 });
